@@ -398,28 +398,53 @@ class WebSocketServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def _outbound_policy_from_env():
+    """Optional echo send policy (WS_ECHO_FRAGMENT_BYTES / WS_ECHO_COMPRESS_AT).
+
+    Unset or 0 WS_ECHO_FRAGMENT_BYTES keeps the original single-frame echo.
+    Any invalid value is a hard startup failure, never a silent rewrite.
+    """
+    raw_fragment = os.environ.get("WS_ECHO_FRAGMENT_BYTES", "0")
+    try:
+        fragment_bytes = int(raw_fragment)
+    except ValueError:
+        raise SystemExit(f"WS_ECHO_FRAGMENT_BYTES={raw_fragment!r} is not an integer")
+    if fragment_bytes == 0:
+        return None
+    raw_compress = os.environ.get("WS_ECHO_COMPRESS_AT", "256")
+    try:
+        compress_at = int(raw_compress)
+    except ValueError:
+        raise SystemExit(f"WS_ECHO_COMPRESS_AT={raw_compress!r} is not an integer")
+    try:
+        return OutboundPolicy(fragment_bytes, compress_at)
+    except ValueError as exc:
+        raise SystemExit(f"invalid echo send configuration: {exc}")
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     port = int(os.environ.get("WS_PORT", "8080"))
     deadline_ms = float(os.environ.get("WS_CLOSE_DEADLINE_MS", "3000"))
+    outbound_policy = _outbound_policy_from_env()  # fails before binding
     server = WebSocketServer(("0.0.0.0", port), WebSocketHandshakeHandler)
     server.close_deadline = deadline_ms / 1000.0
-    fragment_bytes = int(os.environ.get("WS_ECHO_FRAGMENT_BYTES", "0"))
-    server.outbound_policy = (
-        OutboundPolicy(
-            fragment_bytes, int(os.environ.get("WS_ECHO_COMPRESS_AT", "256"))
-        )
-        if fragment_bytes
-        else None
-    )
+    server.outbound_policy = outbound_policy
     log.info(
         "listening on 0.0.0.0:%d (close deadline %.0f ms, max message %d bytes)",
         port,
         deadline_ms,
         MAX_MESSAGE_BYTES,
     )
+    if outbound_policy is not None:
+        log.info(
+            "outbound echo policy: fragments <= %d bytes, compression at "
+            ">= %d payload bytes (only when negotiated)",
+            outbound_policy.frame_bytes,
+            outbound_policy.compress_at,
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

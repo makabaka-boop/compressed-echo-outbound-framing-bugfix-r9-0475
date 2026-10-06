@@ -6,6 +6,9 @@ services:
     environment:
       WS_PORT: "8080"                # listening port inside the container
       WS_CLOSE_DEADLINE_MS: "1500"   # injectable close-handshake deadline
+      # 联调开关：回显分片与压缩阈值（0 = 关闭，保留原单帧回显）
+      WS_ECHO_FRAGMENT_BYTES: "${WS_ECHO_FRAGMENT_BYTES:-0}"
+      WS_ECHO_COMPRESS_AT: "${WS_ECHO_COMPRESS_AT:-256}"
     ports:
       - "127.0.0.1:18080:8080"
     restart: unless-stopped
@@ -26,3 +29,7 @@ services:
       - "8080"
       - --close-deadline-ms
       - "1500"
+      - --fragment-bytes
+      - "${WS_ECHO_FRAGMENT_BYTES:-0}"
+      - --compress-at
+      - "${WS_ECHO_COMPRESS_AT:-256}"

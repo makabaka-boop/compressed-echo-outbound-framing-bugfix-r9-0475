@@ -6,6 +6,11 @@ library is used anywhere. Each test opens a fresh TCP connection and performs
 a manual HTTP Upgrade handshake.
 
 Usage: python3 test_ws_echo.py [--host H] [--port P] [--close-deadline-ms MS]
+                               [--fragment-bytes N] [--compress-at M]
+
+--fragment-bytes/--compress-at must mirror the server's WS_ECHO_FRAGMENT_BYTES
+/ WS_ECHO_COMPRESS_AT; when fragmentation is off (0) the outbound-policy
+tests are skipped and the original single-frame echo is verified.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import base64
 import os
 import socket
 import struct
+import subprocess
 import sys
 import time
 import zlib
@@ -93,6 +99,12 @@ def pmd_compress(data: bytes) -> bytes:
     return out[:-4]
 
 
+def pmd_decompress(data: bytes) -> bytes:
+    """Client-side permessage-deflate decode: append the tail, raw inflate."""
+    d = zlib.decompressobj(-15)
+    return d.decompress(data + b"\x00\x00\xff\xff") + d.flush()
+
+
 # ------------------------------------------------------------ connection
 
 
@@ -149,18 +161,47 @@ class Conn:
         self.close()
 
 
-def expect_data(c, opcode, payload, what="echo"):
-    f = c.read()
+def read_message(c, what="echo"):
+    """Read one complete data message from the server, fragment by fragment.
+
+    Returns (opcode, payload, frames): the message opcode, the reassembled
+    (and, when RSV1 was set, decompressed) payload, and the raw frames so
+    tests can assert fragment sizes, opcodes and RSV1 placement. Enforces
+    the client-side framing contract: the first frame carries the message
+    opcode, later frames are bare continuations, FIN on the last only.
+    """
+    frames = [c.read()]
+    first = frames[0]
     check(
-        f["opcode"] == opcode,
-        f"{what}: expected opcode {opcode:#x}, got {f['opcode']:#x} "
-        f"(payload {f['payload'][:40]!r})",
+        first["opcode"] in (OP_TEXT, OP_BINARY),
+        f"{what}: expected a data frame, got opcode {first['opcode']:#x} "
+        f"(payload {first['payload'][:40]!r})",
     )
-    check(f["fin"], f"{what}: expected FIN on complete message")
+    while not frames[-1]["fin"]:
+        f = c.read()
+        check(
+            f["opcode"] == OP_CONT,
+            f"{what}: expected continuation frame, got opcode {f['opcode']:#x} "
+            f"(fragment #{len(frames)})",
+        )
+        frames.append(f)
+    for f in frames[1:]:
+        check(not f["rsv1"], f"{what}: RSV1 set on a continuation frame")
+    raw = b"".join(f["payload"] for f in frames)
+    payload = pmd_decompress(raw) if first["rsv1"] else raw
+    return first["opcode"], payload, frames
+
+
+def expect_data(c, opcode, payload, what="echo"):
+    got_opcode, got_payload, _ = read_message(c, what)
     check(
-        f["payload"] == payload,
-        f"{what}: payload mismatch ({len(f['payload'])} vs {len(payload)} bytes): "
-        f"{f['payload'][:60]!r} != {payload[:60]!r}",
+        got_opcode == opcode,
+        f"{what}: expected opcode {opcode:#x}, got {got_opcode:#x}",
+    )
+    check(
+        got_payload == payload,
+        f"{what}: payload mismatch ({len(got_payload)} vs {len(payload)} bytes): "
+        f"{got_payload[:60]!r} != {payload[:60]!r}",
     )
 
 
@@ -426,7 +467,7 @@ def test_close_echo_and_no_business_after_close(cfg):
             while True:
                 f = c.read()
                 check(
-                    f["opcode"] not in (OP_TEXT, OP_BINARY),
+                    f["opcode"] not in (OP_TEXT, OP_BINARY, OP_CONT),
                     f"business frame after close: {f['payload'][:40]!r}",
                 )
         except EOFError:
@@ -485,6 +526,241 @@ def test_handshake_rejected_without_upgrade(cfg):
         sock.close()
 
 
+# ----------------------------------------------------- outbound policy tests
+# These run only when the server was started with WS_ECHO_FRAGMENT_BYTES and
+# the runner was told via --fragment-bytes / --compress-at.
+
+
+def _sized(unit, n):
+    """Repeat unit to exactly n bytes (ASCII units stay valid UTF-8)."""
+    return (unit * (n // len(unit) + 1))[:n]
+
+
+def _incompressible(n):
+    """n bytes of deterministic pseudo-random data (deflate cannot shrink it)."""
+    out = bytearray()
+    state = 0x12345678
+    for _ in range(n):
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        out.append((state >> 16) & 0xFF)
+    return bytes(out)
+
+
+def test_outbound_text_fragment_shape(cfg):
+    msg = _sized(b"fragment-shape-", cfg.fragment_bytes * 3 + 1)
+    with Conn(cfg) as c:
+        c.send(build_frame(OP_TEXT, msg))
+        opcode, got, frames = read_message(c, "fragmented text echo")
+        check(opcode == OP_TEXT, f"message type changed: opcode {opcode:#x}")
+        check(got == msg, "reassembled text differs from the validated message")
+        check(len(frames) > 1, "expected the echo to be fragmented")
+        check(
+            frames[0]["opcode"] == OP_TEXT,
+            "first fragment must carry the message opcode",
+        )
+        check(
+            all(f["opcode"] == OP_CONT for f in frames[1:]),
+            "later fragments must be continuations",
+        )
+        check(
+            all(not f["fin"] for f in frames[:-1]),
+            "FIN set before the last fragment",
+        )
+        for f in frames:
+            check(
+                len(f["payload"]) <= cfg.fragment_bytes,
+                f"fragment of {len(f['payload'])} bytes exceeds "
+                f"WS_ECHO_FRAGMENT_BYTES={cfg.fragment_bytes}",
+            )
+            check(not f["rsv1"], "RSV1 set without negotiated compression")
+
+
+def test_outbound_binary_fragment_shape(cfg):
+    msg = bytes(i % 256 for i in range(cfg.fragment_bytes * 2 + 5))
+    with Conn(cfg) as c:
+        c.send(build_frame(OP_BINARY, msg))
+        opcode, got, frames = read_message(c, "fragmented binary echo")
+        check(opcode == OP_BINARY, f"message type changed: opcode {opcode:#x}")
+        check(got == msg, "reassembled binary differs from the validated message")
+        check(len(frames) > 1, "expected the echo to be fragmented")
+        check(frames[0]["opcode"] == OP_BINARY, "first fragment lost the binary opcode")
+        check(
+            all(f["opcode"] == OP_CONT for f in frames[1:]),
+            "later fragments must be continuations",
+        )
+        check(
+            all(len(f["payload"]) <= cfg.fragment_bytes for f in frames),
+            "fragment exceeds WS_ECHO_FRAGMENT_BYTES",
+        )
+
+
+def test_outbound_empty_message_delivered_once(cfg):
+    with Conn(cfg) as c:
+        c.send(build_frame(OP_TEXT, b""))
+        f = c.read()
+        check(
+            f["opcode"] == OP_TEXT and f["fin"] and f["payload"] == b"",
+            f"empty text echo must be one empty FIN frame, got {f}",
+        )
+        c.send(build_frame(OP_BINARY, b""))
+        f = c.read()
+        # a duplicated empty delivery would surface here as an extra frame
+        check(
+            f["opcode"] == OP_BINARY and f["fin"] and f["payload"] == b"",
+            f"empty binary echo must be one empty FIN frame, got {f}",
+        )
+        c.send(build_frame(OP_TEXT, b"after-empty"))
+        expect_data(c, OP_TEXT, b"after-empty", "message after empty echoes")
+
+
+def test_outbound_compression_only_when_negotiated(cfg):
+    # incompressible payload: compressed form is >= the plaintext, so the
+    # fragment cap is genuinely exercised on the wire
+    size = max(cfg.compress_at, min(3 * cfg.fragment_bytes + 7, MAX_MESSAGE))
+    msg = _incompressible(size)
+    with Conn(cfg) as c:  # no extension offer
+        check(
+            "sec-websocket-extensions" not in c.headers,
+            "server offered permessage-deflate unprompted",
+        )
+        c.send(build_frame(OP_BINARY, msg))
+        opcode, got, frames = read_message(c, "unnegotiated echo")
+        check(got == msg and opcode == OP_BINARY, "unnegotiated echo corrupted")
+        check(
+            all(not f["rsv1"] for f in frames),
+            "compression used without negotiation",
+        )
+    with Conn(cfg, extensions="permessage-deflate") as c:
+        c.send(build_frame(OP_BINARY, msg))
+        opcode, got, frames = read_message(c, "compressed echo")
+        check(opcode == OP_BINARY, "compression changed the message type")
+        check(got == msg, "decompressed echo differs from the validated message")
+        check(frames[0]["rsv1"], "threshold reached but echo not compressed")
+        check(len(frames) > 1, "expected the compressed echo to be fragmented")
+        for f in frames:
+            check(
+                len(f["payload"]) <= cfg.fragment_bytes,
+                f"compressed fragment of {len(f['payload'])} bytes exceeds "
+                f"WS_ECHO_FRAGMENT_BYTES={cfg.fragment_bytes}",
+            )
+
+
+def test_outbound_compression_threshold_boundary(cfg):
+    with Conn(cfg, extensions="permessage-deflate") as c:
+        below = _sized(b"t", cfg.compress_at - 1)
+        c.send(build_frame(OP_TEXT, below))
+        _, got, frames = read_message(c, "below-threshold echo")
+        check(got == below, "below-threshold echo corrupted")
+        check(
+            all(not f["rsv1"] for f in frames),
+            f"compressed below the {cfg.compress_at}-byte threshold",
+        )
+        at = _sized(b"u", cfg.compress_at)
+        c.send(build_frame(OP_TEXT, at))
+        _, got, frames = read_message(c, "at-threshold echo")
+        check(got == at, "at-threshold echo corrupted")
+        check(frames[0]["rsv1"], f"not compressed at the {cfg.compress_at}-byte threshold")
+
+
+def test_outbound_consecutive_messages_independent(cfg):
+    msgs = [
+        (OP_TEXT, _sized(b"first-message-", cfg.compress_at)),
+        (OP_BINARY, _sized(bytes(range(256)), cfg.compress_at)),
+        (OP_TEXT, _sized(b"third-message-", cfg.compress_at)),
+    ]
+    with Conn(cfg, extensions="permessage-deflate") as c:
+        c.send(*(build_frame(op, payload) for op, payload in msgs))
+        for i, (op, payload) in enumerate(msgs):
+            got_op, got, frames = read_message(c, f"echo #{i}")
+            check(got_op == op, f"echo #{i}: type changed to {got_op:#x}")
+            check(frames[0]["rsv1"], f"echo #{i}: expected compression")
+            # each message must decompress standalone (no context takeover):
+            # read_message already inflated it from a fresh context
+            check(
+                got == payload,
+                f"echo #{i}: does not match its own validated message "
+                f"(cross-message state?)",
+            )
+
+
+def test_outbound_control_frames_stay_independent(cfg):
+    with Conn(cfg) as c:
+        c.send(build_frame(OP_TEXT, b"x" * (cfg.fragment_bytes * 2 + 1)))
+        _, got, frames = read_message(c, "fragmented echo before ping")
+        check(len(frames) > 1, "expected the echo to be fragmented")
+        c.send(build_frame(OP_PING, b"still-independent"))
+        f = c.read()
+        check(
+            f["opcode"] == OP_PONG
+            and f["fin"]
+            and not f["rsv1"]
+            and f["payload"] == b"still-independent",
+            f"pong after fragmented echo must be a single bare frame, got {f}",
+        )
+        c.send(build_frame(OP_TEXT, b"next-message"))
+        expect_data(c, OP_TEXT, b"next-message", "message after ping")
+
+
+OUTBOUND_TESTS = [
+    ("outbound: text fragment shape (opcode/CONT/FIN/cap)", test_outbound_text_fragment_shape),
+    ("outbound: binary fragment shape", test_outbound_binary_fragment_shape),
+    ("outbound: empty message delivered exactly once", test_outbound_empty_message_delivered_once),
+    ("outbound: compression only when negotiated", test_outbound_compression_only_when_negotiated),
+    ("outbound: compression threshold boundary", test_outbound_compression_threshold_boundary),
+    ("outbound: consecutive messages independent", test_outbound_consecutive_messages_independent),
+    ("outbound: control frames stay independent", test_outbound_control_frames_stay_independent),
+]
+
+
+# ------------------------------------------------------- startup validation
+
+SERVER_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ws_echo_server.py"
+)
+
+
+def test_startup_invalid_send_config_fails(cfg):
+    if not os.path.exists(SERVER_SCRIPT):
+        print(f"SKIP (server script not found at {SERVER_SCRIPT})")
+        return
+    cases = [
+        ({"WS_ECHO_FRAGMENT_BYTES": "abc"}, "WS_ECHO_FRAGMENT_BYTES"),
+        ({"WS_ECHO_FRAGMENT_BYTES": "-1"}, "WS_ECHO_FRAGMENT_BYTES"),
+        ({"WS_ECHO_FRAGMENT_BYTES": "5000"}, "WS_ECHO_FRAGMENT_BYTES"),
+        (
+            {"WS_ECHO_FRAGMENT_BYTES": "8", "WS_ECHO_COMPRESS_AT": "0"},
+            "WS_ECHO_COMPRESS_AT",
+        ),
+        (
+            {"WS_ECHO_FRAGMENT_BYTES": "8", "WS_ECHO_COMPRESS_AT": "20000"},
+            "WS_ECHO_COMPRESS_AT",
+        ),
+        (
+            {"WS_ECHO_FRAGMENT_BYTES": "8", "WS_ECHO_COMPRESS_AT": "x"},
+            "WS_ECHO_COMPRESS_AT",
+        ),
+    ]
+    for extra, needle in cases:
+        env = dict(os.environ, WS_PORT="18099", WS_CLOSE_DEADLINE_MS="200")
+        env.update(extra)
+        proc = subprocess.run(
+            [sys.executable, SERVER_SCRIPT],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+        check(
+            proc.returncode != 0,
+            f"{extra}: server started instead of failing (rc=0)",
+        )
+        check(
+            needle in proc.stderr,
+            f"{extra}: stderr does not name {needle}: {proc.stderr[:200]!r}",
+        )
+
+
 TESTS = [
     ("basic text echo", test_basic_text),
     ("basic binary echo", test_basic_binary),
@@ -523,6 +799,10 @@ TESTS = [
     ("invalid close code -> 1002", test_invalid_close_code_rejected),
     ("close reason not utf-8 -> 1007", test_close_reason_not_utf8),
     ("handshake without upgrade -> 400", test_handshake_rejected_without_upgrade),
+    (
+        "startup: invalid send config fails clearly",
+        test_startup_invalid_send_config_fails,
+    ),
 ]
 
 
@@ -535,6 +815,19 @@ def main():
         type=float,
         default=1500,
         help="must match the server's WS_CLOSE_DEADLINE_MS",
+    )
+    ap.add_argument(
+        "--fragment-bytes",
+        type=int,
+        default=0,
+        help="must match the server's WS_ECHO_FRAGMENT_BYTES (0 = echo not "
+        "fragmented; the outbound-policy tests are skipped)",
+    )
+    ap.add_argument(
+        "--compress-at",
+        type=int,
+        default=256,
+        help="must match the server's WS_ECHO_COMPRESS_AT",
     )
     cfg = ap.parse_args()
     cfg.deadline = cfg.close_deadline_ms / 1000.0
@@ -551,8 +844,11 @@ def main():
                 sys.exit(2)
             time.sleep(0.3)
 
+    tests = list(TESTS)
+    if cfg.fragment_bytes:
+        tests += OUTBOUND_TESTS
     passed = failed = 0
-    for name, fn in TESTS:
+    for name, fn in tests:
         try:
             fn(cfg)
             print(f"PASS  {name}")
@@ -560,7 +856,7 @@ def main():
         except Exception as exc:
             print(f"FAIL  {name}: {exc}")
             failed += 1
-    print(f"\n{passed} passed, {failed} failed, {len(TESTS)} total")
+    print(f"\n{passed} passed, {failed} failed, {len(tests)} total")
     sys.exit(1 if failed else 0)
 
 
