@@ -6,6 +6,9 @@ services:
     environment:
       WS_PORT: "8080"                # listening port inside the container
       WS_CLOSE_DEADLINE_MS: "1500"   # injectable close-handshake deadline
+      # opt-in outbound echo fragmentation; unset keeps the legacy echo:
+      # WS_ECHO_FRAGMENT_BYTES: "64"
+      # WS_ECHO_COMPRESS_AT: "256"
     ports:
       - "127.0.0.1:18080:8080"
     restart: unless-stopped
@@ -17,6 +20,8 @@ services:
       - ws-echo
     volumes:
       - ./test_ws_echo.py:/app/test_ws_echo.py:ro
+    # if WS_ECHO_FRAGMENT_BYTES is set on ws-echo, pass the same values:
+    #   --fragment-bytes 64 --compress-at 256
     command:
       - python
       - /app/test_ws_echo.py

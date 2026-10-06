@@ -11,8 +11,12 @@ RFC 6455 帧编解码与消息状态机，控制帧永远不会进入解压器�
 # 唯一监听进程（容器内 8080，宿主映射 127.0.0.1:18080）
 docker compose up --build
 
-# 手工构造帧的原始 TCP 测试（31 项），从宿主机执行：
+# 手工构造帧的原始 TCP 测试（39 项），从宿主机执行：
 python3 test_ws_echo.py --port 18080 --close-deadline-ms 1500
+
+# 服务端开启发送分片后，须把生效配置传给测试以便重组/解压核对：
+python3 test_ws_echo.py --port 18080 --close-deadline-ms 1500 \
+  --fragment-bytes 64 --compress-at 256
 
 # 或在 compose 内执行（一次性客户端，不是监听进程）：
 docker compose --profile test run --rm ws-echo-tests
@@ -26,6 +30,8 @@ docker compose --profile test run --rm ws-echo-tests
 | --- | --- | --- |
 | `WS_PORT` | `8080` | 监听端口 |
 | `WS_CLOSE_DEADLINE_MS` | `3000` | 可注入的关闭期限：发出 Close 后等待对端 Close 的上限，到期强制关闭 TCP |
+| `WS_ECHO_FRAGMENT_BYTES` | 未设置 | 设置为 `1..4096` 开启回显分片；未设置/为空时保留原单帧回显 |
+| `WS_ECHO_COMPRESS_AT` | `256` | 开启分片后，完整业务载荷达到该字节数（`1..16384`）且已协商压缩时才压缩 |
 
 ## 协议行为
 
@@ -58,8 +64,24 @@ docker compose --profile test run --rm ws-echo-tests
 
 
 ## 可选压缩回显分片
-设置 `WS_ECHO_FRAGMENT_BYTES=1..4096` 开启发送分片，未设置时保留原单帧回显。
-`WS_ECHO_COMPRESS_AT=1..16384` 按完整业务载荷字节数选择压缩，仅在已协商压缩时使用；双向仍无上下文接管。
-每个发送片段负载均不得超过设置的字节上限，重新组装后必须等于完整校验过的原消息。
-控制帧保持独立且不压缩，后续消息无历史依赖；空消息也交付一次。错误输入和关闭后的业务不产生任何回显片段。
-设置非法时启动须明确失败，不悄悄更改配置。
+设置 `WS_ECHO_FRAGMENT_BYTES=1..4096` 开启发送分片，未设置（或为空）时保留原单帧回显。
+`WS_ECHO_COMPRESS_AT=1..16384`（默认 256）按**完整业务载荷**字节数选择压缩，
+且仅在连接已协商 permessage-deflate 时生效；双向仍无上下文接管，每条消息各自
+新建压缩器，后续消息不依赖前一条的历史。
+
+- 首帧保留原 TEXT/BINARY 操作码并仅在压缩时置 RSV1，其余帧全部是 CONTINUATION，
+  FIN 只出现在最后一帧；因此分片不改变业务消息类型与字节，客户端按 RFC 6455
+  逐帧重组即得到校验过的原消息。
+- 压缩对**整条消息**生成一个 raw-DEFLATE 流（sync-flush 尾部只砍一次），
+  再按上限切片——即使不可压缩数据压缩后变大，每个片段的线上载荷仍
+  ≤ `WS_ECHO_FRAGMENT_BYTES`。
+- 控制帧（Pong/Close）始终独立发送、不分片、不压缩，可插在回显片段序列之外；
+  空消息恰好交付一个空帧（原操作码、FIN、无 RSV1）。
+- 回显片段列表在发送前整体生成；坏输入或 Close 之后的业务不会产生任何片段，
+  Close 帧之前不会出现半条回显。
+- 配置非法（非整数、超出范围）时进程在绑定端口前以非零状态退出并打印
+  `invalid outbound echo configuration: ...`，不悄悄回退或更改配置。
+
+发送链路专项测试（线帧格式、操作码/FIN/RSV1 归属、压缩片段不超上限、
+阈值与协商门槛、空消息、同连接连续消息独立、Ping 间 Pong 独立、
+非法配置启动失败）均包含在 `test_ws_echo.py`；部分用例在未开启分片时自动跳过。

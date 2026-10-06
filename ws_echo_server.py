@@ -30,7 +30,7 @@ import os
 import socket
 import struct
 import zlib
-from outbound import OutboundPolicy
+from outbound import OutboundConfigError, OutboundPolicy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("ws-echo")
@@ -228,10 +228,10 @@ class WebSocketConnection:
         if self.outbound_policy is None:
             self.send_frame(opcode, message)
         else:
-            for final, compressed, kind, part in self.outbound_policy.frames(
+            for fin, rsv1, frame_opcode, part in self.outbound_policy.frames(
                 opcode, message, self.pmd_enabled
             ):
-                self.send_frame(kind, part, final, compressed)
+                self.send_frame(frame_opcode, part, fin, rsv1)
 
     def _handle_control(self, opcode: int, payload: bytes):
         if opcode == OP_PING:
@@ -398,22 +398,60 @@ class WebSocketServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def _load_outbound_policy() -> "OutboundPolicy | None":
+    """Parse the opt-in outbound echo configuration.
+
+    Unset/empty WS_ECHO_FRAGMENT_BYTES keeps the legacy single-frame echo.
+    Any invalid value fails startup explicitly before the socket is bound,
+    rather than silently changing the configuration.
+    """
+    raw_fragment = os.environ.get("WS_ECHO_FRAGMENT_BYTES", "").strip()
+    if not raw_fragment:
+        return None  # new mode not enabled: original behaviour is preserved
+    try:
+        fragment_bytes = int(raw_fragment)
+    except ValueError:
+        raise OutboundConfigError(
+            f"WS_ECHO_FRAGMENT_BYTES must be an integer, got {raw_fragment!r}"
+        )
+    raw_compress_at = os.environ.get("WS_ECHO_COMPRESS_AT", "").strip()
+    if raw_compress_at:
+        try:
+            compress_at = int(raw_compress_at)
+        except ValueError:
+            raise OutboundConfigError(
+                f"WS_ECHO_COMPRESS_AT must be an integer, got {raw_compress_at!r}"
+            )
+    else:
+        from outbound import DEFAULT_COMPRESS_AT
+
+        compress_at = DEFAULT_COMPRESS_AT
+    # the constructor enforces the documented ranges
+    return OutboundPolicy(fragment_bytes, compress_at)
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     port = int(os.environ.get("WS_PORT", "8080"))
     deadline_ms = float(os.environ.get("WS_CLOSE_DEADLINE_MS", "3000"))
+    try:
+        outbound_policy = _load_outbound_policy()
+    except OutboundConfigError as exc:
+        # explicit startup failure; do not bind or serve with a guessed config
+        log.error("invalid outbound echo configuration: %s", exc)
+        raise SystemExit(2)
     server = WebSocketServer(("0.0.0.0", port), WebSocketHandshakeHandler)
     server.close_deadline = deadline_ms / 1000.0
-    fragment_bytes = int(os.environ.get("WS_ECHO_FRAGMENT_BYTES", "0"))
-    server.outbound_policy = (
-        OutboundPolicy(
-            fragment_bytes, int(os.environ.get("WS_ECHO_COMPRESS_AT", "256"))
+    server.outbound_policy = outbound_policy
+    if outbound_policy is not None:
+        log.info(
+            "outbound echo fragmentation enabled (fragment cap %d bytes, "
+            "compress at %d bytes)",
+            outbound_policy.frame_bytes,
+            outbound_policy.compress_at,
         )
-        if fragment_bytes
-        else None
-    )
     log.info(
         "listening on 0.0.0.0:%d (close deadline %.0f ms, max message %d bytes)",
         port,
